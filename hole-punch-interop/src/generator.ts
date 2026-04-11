@@ -97,8 +97,8 @@ function buildSpec(name: string, dialerImage: string, listenerImage: string, rou
                     DELAY_MS: routerDelay
                 },
                 networks: {
-                    lan_dialer: {},
                     internet: {},
+                    lan_dialer: {},
                 },
                 cap_add: ["NET_ADMIN"],
             },
@@ -125,8 +125,8 @@ function buildSpec(name: string, dialerImage: string, listenerImage: string, rou
                     DELAY_MS: routerDelay
                 },
                 networks: {
-                    lan_listener: {},
                     internet: {},
+                    lan_listener: {},
                 },
                 cap_add: ["NET_ADMIN"]
             },

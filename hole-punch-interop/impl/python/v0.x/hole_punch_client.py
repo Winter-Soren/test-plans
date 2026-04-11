@@ -173,9 +173,12 @@ class _HolePunchTCPListener:
                 if remote_tuple is not None:
                     remote_host, remote_port = remote_tuple
                 await self.handler(tcp_stream)
-            except Exception:
-                logger.debug(
-                    "connection from %s:%s failed", remote_host, remote_port
+            except Exception as exc:
+                logger.warning(
+                    "incoming TCP connection from %s:%s failed: %s",
+                    remote_host,
+                    remote_port,
+                    f"{type(exc).__name__}: {exc!r}",
                 )
 
         nursery.start_soon(trio.serve_listeners, handler, [listener])
@@ -686,6 +689,21 @@ def _is_relay_addr(addr: multiaddr.Multiaddr) -> bool:
     return "/p2p-circuit" in str(addr)
 
 
+def _strip_p2p_suffix(addr: multiaddr.Multiaddr) -> multiaddr.Multiaddr:
+    try:
+        peer_id_str = addr.get_peer_id()
+    except Exception:
+        peer_id_str = None
+
+    if not peer_id_str:
+        return addr
+
+    try:
+        return addr.decapsulate(multiaddr.Multiaddr(f"/p2p/{peer_id_str}"))
+    except Exception:
+        return addr
+
+
 async def _identify_observed_addrs(
     host: BasicHost, relay_peer_id: ID, tp: str, attempts: int = 6
 ) -> list[bytes]:
@@ -822,6 +840,19 @@ async def _handle_legacy_stop_stream(
 
 
 def _install_dcutr_framing_patch(dcutr: DCUtRProtocol) -> None:
+    def _decode_observed_addrs(self: DCUtRProtocol, addr_bytes: list[bytes]) -> list[multiaddr.Multiaddr]:
+        result: list[multiaddr.Multiaddr] = []
+
+        for addr_byte in addr_bytes:
+            try:
+                addr = _strip_p2p_suffix(multiaddr.Multiaddr(addr_byte))
+                if str(addr).startswith("/ip"):
+                    result.append(addr)
+            except Exception as exc:
+                logger.debug("error decoding multiaddr: %s", exc)
+
+        return result
+
     async def _verify_direct_connection(self: DCUtRProtocol, peer_id: ID) -> bool:
         network = self.host.get_network()
         conn_or_conns = network.connections.get(peer_id)
@@ -863,7 +894,12 @@ def _install_dcutr_framing_patch(dcutr: DCUtRProtocol) -> None:
 
     async def _dial_peer(self: DCUtRProtocol, peer_id: ID, addr: multiaddr.Multiaddr) -> None:
         try:
-            logger.info("attempting direct hole-punch dial to %s at %s", peer_id, addr)
+            dial_addr = _strip_p2p_suffix(addr)
+            logger.info(
+                "attempting direct hole-punch dial to %s at %s",
+                peer_id,
+                dial_addr,
+            )
 
             network = self.host.get_network()
             direct_dial = getattr(network, "_dial_addr_single_attempt", None)
@@ -871,7 +907,7 @@ def _install_dcutr_framing_patch(dcutr: DCUtRProtocol) -> None:
                 raise RuntimeError("swarm direct dial helper unavailable")
 
             with trio.fail_after(self.dial_timeout):
-                await direct_dial(addr, peer_id)
+                await direct_dial(dial_addr, peer_id)
 
             await trio.sleep(0.1)
 
@@ -879,19 +915,24 @@ def _install_dcutr_framing_patch(dcutr: DCUtRProtocol) -> None:
                 logger.info(
                     "verified direct hole-punch connection to %s at %s",
                     peer_id,
-                    addr,
+                    dial_addr,
                 )
                 self._direct_connections.add(peer_id)
             else:
                 logger.info(
                     "hole-punch dial reached %s at %s without a direct connection",
                     peer_id,
-                    addr,
+                    dial_addr,
                 )
         except trio.TooSlowError:
-            logger.debug("timeout dialing %s at %s", peer_id, addr)
+            logger.warning("timeout dialing %s at %s", peer_id, addr)
         except Exception as exc:
-            logger.debug("error dialing %s at %s: %s", peer_id, addr, exc)
+            logger.warning(
+                "error dialing %s at %s: %s",
+                peer_id,
+                addr,
+                f"{type(exc).__name__}: {exc!r}",
+            )
 
     async def _handle_dcutr_stream(self: DCUtRProtocol, stream) -> None:
         try:
@@ -936,21 +977,56 @@ def _install_dcutr_framing_patch(dcutr: DCUtRProtocol) -> None:
                 with trio.fail_after(self.write_timeout):
                     await _write_legacy_message(stream, response.SerializeToString())
 
-                with trio.fail_after(self.read_timeout):
-                    sync_bytes = await _read_legacy_message(stream)
+                early_attempt_done = trio.Event()
+                early_attempt_success = False
 
-                sync_msg = HolePunch()
-                sync_msg.ParseFromString(sync_bytes)
-                if sync_msg.type != HolePunch.SYNC:
-                    logger.warning(
-                        "expected DCUtR SYNC from %s, got %s",
-                        remote_peer_id,
-                        sync_msg.type,
-                    )
-                    await stream.close()
-                    return
+                async def _early_attempt() -> None:
+                    nonlocal early_attempt_success
+                    try:
+                        if not peer_addrs:
+                            return
+                        # Python responder overhead is noticeably higher than Rust's.
+                        # Pre-punch slightly before SYNC handling completes so the
+                        # router has state when the remote SYN arrives.
+                        await trio.sleep(0.02)
+                        logger.info(
+                            "starting early pre-SYNC hole-punch attempt toward %s",
+                            remote_peer_id,
+                        )
+                        early_attempt_success = await self._perform_hole_punch(
+                            remote_peer_id, peer_addrs
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "early hole-punch attempt failed for %s: %s",
+                            remote_peer_id,
+                            exc,
+                        )
+                    finally:
+                        early_attempt_done.set()
 
-                success = await self._perform_hole_punch(remote_peer_id, peer_addrs)
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(_early_attempt)
+
+                    with trio.fail_after(self.read_timeout):
+                        sync_bytes = await _read_legacy_message(stream)
+
+                    sync_msg = HolePunch()
+                    sync_msg.ParseFromString(sync_bytes)
+                    if sync_msg.type != HolePunch.SYNC:
+                        logger.warning(
+                            "expected DCUtR SYNC from %s, got %s",
+                            remote_peer_id,
+                            sync_msg.type,
+                        )
+                        await stream.close()
+                        return
+
+                    await early_attempt_done.wait()
+
+                success = early_attempt_success
+                if not success:
+                    success = await self._perform_hole_punch(remote_peer_id, peer_addrs)
                 if success:
                     logger.info(
                         "successfully established direct connection with %s",
@@ -1025,9 +1101,10 @@ def _install_dcutr_framing_patch(dcutr: DCUtRProtocol) -> None:
                 if peer_addrs:
                     self.host.get_peerstore().add_addrs(peer_id, peer_addrs, 600)
 
-                # Match rust-libp2p's DCUtR timing more closely: after SYNC,
-                # both sides should attempt the direct dial roughly half an RTT later.
-                punch_time = time.time() + max(rtt / 2.0, 0.05)
+                # In this Docker NAT harness, Python responder overhead is already
+                # high enough that waiting before the direct dial causes Rust's SYN
+                # to arrive first and get reset. Punch immediately after SYNC.
+                punch_time = time.time()
                 sync_msg = HolePunch()
                 sync_msg.type = HolePunch.SYNC
                 with trio.fail_after(self.write_timeout):
@@ -1063,6 +1140,7 @@ def _install_dcutr_framing_patch(dcutr: DCUtRProtocol) -> None:
         finally:
             self._in_progress.discard(peer_id)
 
+    dcutr._decode_observed_addrs = MethodType(_decode_observed_addrs, dcutr)  # type: ignore[method-assign]
     dcutr._verify_direct_connection = MethodType(_verify_direct_connection, dcutr)  # type: ignore[method-assign]
     dcutr._dial_peer = MethodType(_dial_peer, dcutr)  # type: ignore[method-assign]
     dcutr._handle_dcutr_stream = MethodType(_handle_dcutr_stream, dcutr)  # type: ignore[method-assign]
