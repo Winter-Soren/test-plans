@@ -18,7 +18,15 @@ image.json: py-libp2p-${commitSha} Dockerfile hole_punch_client.py pyproject.tom
 py-libp2p-${commitSha}: $(if $(PY_LIBP2P_DIR),,py-libp2p-${commitSha}.zip)
 	@if [ -n "$(PY_LIBP2P_DIR)" ]; then \
 		rm -rf $@ && mkdir -p $@ && \
-		rsync -a --delete "$(PY_LIBP2P_DIR)"/ $@/; \
+		rsync -a --delete \
+			--exclude '.git/' \
+			--exclude '.venv/' \
+			--exclude 'venv/' \
+			--exclude '__pycache__/' \
+			--exclude '.pytest_cache/' \
+			--exclude '.mypy_cache/' \
+			--exclude 'references/' \
+			"$(PY_LIBP2P_DIR)"/ $@/; \
 	else \
 		unzip -o py-libp2p-${commitSha}.zip; \
 	fi
